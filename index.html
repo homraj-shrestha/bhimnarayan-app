@@ -210,6 +210,15 @@ input,select,button{font-family:inherit}
     <small class="hint">डेटा browser मै बस्छ। नियमित Backup लिनुहोस्, विशेष गरी browser cache हटाउनु अघि।</small>
   </div>
   <div class="card">
+    <h2>☁️ Cloud Sync (डेस्कटप र मोबाइल मिलाउने)</h2>
+    <input id="cUrl" placeholder="Apps Script Web App URL (/exec)" style="width:100%;margin-bottom:6px;box-sizing:border-box">
+    <input id="cKey" placeholder="Sync Key (आफूले बनाएको गोप्य शब्द)" style="width:100%;margin-bottom:6px;box-sizing:border-box">
+    <button class="btn" onclick="saveCloudSettings()">सेभ र Sync गर्नुहोस्</button>
+    <button class="btn green" onclick="cloudSync(false)">🔄 अहिले Sync गर्नुहोस्</button>
+    <div id="syncStatus" class="note"></div>
+    <small class="hint">दुवै उपकरणमा एउटै URL र Sync Key राख्नुहोस्। नेट आएपछि आफैँ मिल्छ।</small>
+  </div>
+  <div class="card">
     <h2>📱 फोन व्यूअर (Password सहित)</h2>
     <button class="btn green" onclick="buildViewer()">📱 फोन व्यूअर बनाउनुहोस्</button>
     <small class="hint">Password सहितको index.html बन्छ। Netlify मा राखेर होम स्क्रीनमा आइकन बनाउन सकिन्छ।</small>
@@ -267,7 +276,8 @@ function seedDB(){
   return { families, years: [...DEFAULT_YEARS], rates };
 }
 
-function save(){ try { localStorage.setItem(KEY, JSON.stringify(db)); } catch(e) { alert("डेटा सुरक्षित गर्न सकिएन: " + e); } }
+function save(){ try { localStorage.setItem(KEY, JSON.stringify(db)); } catch(e) { alert("डेटा सुरक्षित गर्न सकिएन: " + e); } scheduleCloudSync(); }
+
 function load(){
   try { db = JSON.parse(localStorage.getItem(KEY)); } catch(e) { db = null; }
   if (!db || !Array.isArray(db.families)) db = seedDB();
@@ -280,6 +290,8 @@ function load(){
     }
   });
   if (changed) save();
+  db.tomb = db.tomb || {};
+  db.families.forEach(f => { if (f.ts === undefined) f.ts = 0; Object.keys(f.pay || {}).forEach(y => { if (f.pay[y].ts === undefined) f.pay[y].ts = 0; }); });
   curYear = db.years[db.years.length - 1];
 }
 
@@ -368,7 +380,7 @@ function addFamily(){
   const code = $("fCode").value.trim();
   const bad = codeProblem(code, null);
   if (bad) { alert(bad); return; }
-  db.families.push({ id: "f" + Date.now(), code, name, phone: $("fPhone").value.trim(), address: $("fAddress").value.trim(), pay: {} });
+  db.families.push({ id: "f" + Date.now(), code, name, phone: $("fPhone").value.trim(), address: $("fAddress").value.trim(), pay: {}, ts: Date.now() });
   ["fCode","fName","fPhone","fAddress"].forEach(id => $(id).value = "");
   save(); renderAll();
 }
@@ -395,6 +407,7 @@ function saveEdit(){
   f.code = code; f.name = name;
   f.phone = $("ePhone").value.trim();
   f.address = $("eAddress").value.trim();
+  f.ts = Date.now();
   save(); cancelEdit(); renderAll();
 }
 function deleteFamily(id){
@@ -405,6 +418,8 @@ function deleteFamily(id){
     return;
   }
   if (!confirm(`"${f.name}" मेटाउने हो?`)) return;
+  db.tomb = db.tomb || {};
+  db.tomb[id] = Date.now();
   db.families = db.families.filter(x => x.id !== id);
   save(); renderAll();
 }
@@ -461,7 +476,7 @@ function quickAddFamily(){
   }
   const phone = prompt("सम्पर्क नम्बर (वैकल्पिक):", "") || "";
   const address = prompt("ठेगाना (वैकल्पिक):", "") || "";
-  db.families.push({ id: "f" + Date.now(), code, name, phone: phone.trim(), address: address.trim(), pay: {} });
+  db.families.push({ id: "f" + Date.now(), code, name, phone: phone.trim(), address: address.trim(), pay: {}, ts: Date.now() });
   save(); renderAll();
 }
 
@@ -473,26 +488,15 @@ function setAmt(id, v){
   if (n <= 0 && hasRecord(f, curYear)) {
     if (!confirm(`${f.name} को ${curYear} सालको रकम र रसिद हटाउने हो?`)) { renderCollection(); return; }
   }
-  if (n <= 0) {
-    if (f.pay[curYear] && !String(f.pay[curYear].rcpt || "").trim()) delete f.pay[curYear];
-    else if (f.pay[curYear]) f.pay[curYear].amt = 0;
-  } else {
-    const rc = f.pay[curYear] ? f.pay[curYear].rcpt : "";
-    f.pay[curYear] = { amt: n, rcpt: rc || "" };
-  }
+  const old = f.pay[curYear] || { amt: 0, rcpt: "" };
+  f.pay[curYear] = { amt: n > 0 ? n : 0, rcpt: n > 0 ? (old.rcpt || "") : "", ts: Date.now() };
   save(); renderAll();
 }
 
 function setRcpt(id, v){
   const f = db.families.find(x => x.id === id); if (!f) return;
-  const r = String(v).trim();
-  if (!f.pay[curYear]) {
-    if (!r) return;
-    f.pay[curYear] = { amt: 0, rcpt: r };
-  } else {
-    f.pay[curYear].rcpt = r;
-    if (!r && Number(f.pay[curYear].amt) <= 0) delete f.pay[curYear];
-  }
+  const old = f.pay[curYear] || { amt: 0, rcpt: "" };
+  f.pay[curYear] = { amt: old.amt || 0, rcpt: String(v).trim(), ts: Date.now() };
   save(); renderAll();
 }
 
@@ -825,10 +829,86 @@ async function buildViewer(){
   alert("दुई फाइल बने: index.html र sw.js। दुवैलाई एउटै फोल्डरमा राखेर Netlify मा अपलोड गर्नुहोस्। यसले इन्टरनेट बिना पनि खोल्न मिल्ने बनाउँछ।");
 }
 
+/* ===== Cloud Sync (Google Apps Script) ===== */
+const CLOUD_CFG_KEY = "BHIM_CLOUD_CFG_V1";
+let __syncTimer = null, __syncing = false;
+function getCloudCfg(){ try { return JSON.parse(localStorage.getItem(CLOUD_CFG_KEY)) || {}; } catch(e) { return {}; } }
+function saveCloudCfg(url, key){ localStorage.setItem(CLOUD_CFG_KEY, JSON.stringify({ url: String(url).trim(), key: String(key).trim() })); }
+function setSyncStatus(m){ const el = document.getElementById("syncStatus"); if (el) el.textContent = m; }
+async function cloudReq(action, payload){
+  const c = getCloudCfg();
+  if (!c.url || !c.key) throw new Error("पहिले Web App URL र Sync Key राख्नुहोस्।");
+  const res = await fetch(c.url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action: action, key: c.key, payload: payload || {} }) });
+  const text = await res.text();
+  let d; try { d = JSON.parse(text); } catch(e) { throw new Error("Cloud जवाफ बुझिएन। URL जाँच्नुहोस्।"); }
+  if (!d.ok) throw new Error(d.error || "Cloud त्रुटि");
+  return d;
+}
+/* दुई उपकरणको डेटा मिलाउने: परिवार र वर्षको प्रत्येक रेकर्डमा धेरै नयाँ परिवर्तन जित्छ */
+function mergeCloud(inc){
+  db.tomb = db.tomb || {};
+  Object.keys(inc.tomb || {}).forEach(id => { db.tomb[id] = Math.max(db.tomb[id] || 0, inc.tomb[id] || 0); });
+  const byId = {}; db.families.forEach(f => { byId[f.id] = f; });
+  (inc.families || []).forEach(f2 => {
+    let f1 = byId[f2.id];
+    if (!f1) {
+      const copy = JSON.parse(JSON.stringify(f2));
+      db.families.push(copy); byId[copy.id] = copy; f1 = copy;
+    } else if ((f2.ts || 0) > (f1.ts || 0)) {
+      ["code","name","phone","address"].forEach(k => { f1[k] = f2[k]; });
+      f1.ts = f2.ts;
+    }
+    f1.pay = f1.pay || {};
+    Object.keys(f2.pay || {}).forEach(y => {
+      const p2 = f2.pay[y], p1 = f1.pay[y];
+      if (!p1 || (p2.ts || 0) > (p1.ts || 0)) f1.pay[y] = JSON.parse(JSON.stringify(p2));
+    });
+  });
+  db.families = db.families.filter(f => !(db.tomb[f.id] && db.tomb[f.id] >= (f.ts || 0)));
+  (inc.years || []).forEach(y => { if (db.years.indexOf(y) < 0) db.years.push(y); });
+  db.years.sort(function(a, b){ return Number(a) - Number(b); });
+  Object.keys(inc.rates || {}).forEach(y => { if (db.rates[y] === undefined) db.rates[y] = inc.rates[y]; });
+  if (db.years.indexOf(curYear) < 0) curYear = db.years[db.years.length - 1];
+}
+function scheduleCloudSync(){
+  const c = getCloudCfg(); if (!c.url || !c.key) return;
+  clearTimeout(__syncTimer);
+  __syncTimer = setTimeout(function(){ cloudSync(true); }, 2500);
+}
+async function cloudSync(auto){
+  const c = getCloudCfg();
+  if (!c.url || !c.key) { if (!auto) alert("पहिले Web App URL र Sync Key राख्नुहोस्।"); return; }
+  if (__syncing) return;
+  if (!navigator.onLine) { setSyncStatus("📴 Offline — इन्टरनेट आएपछि मिल्छ"); return; }
+  __syncing = true; setSyncStatus("🔄 Sync हुँदैछ...");
+  try {
+    const r = await cloudReq("sync", {});
+    if (r.db && Array.isArray(r.db.families)) {
+      mergeCloud(r.db);
+      localStorage.setItem(KEY, JSON.stringify(db));
+      renderAll();
+    }
+    await cloudReq("push", db);
+    setSyncStatus("✅ Sync भयो: " + new Date().toLocaleTimeString("ne-NP"));
+  } catch(e) {
+    setSyncStatus("⚠️ Sync भएन: " + e.message);
+    if (!auto) alert("Sync असफल: " + e.message);
+  } finally { __syncing = false; }
+}
+function saveCloudSettings(){
+  const url = document.getElementById("cUrl").value, key = document.getElementById("cKey").value;
+  if (!url.trim() || !key.trim()) { alert("URL र Sync Key दुवै लेख्नुहोस्।"); return; }
+  saveCloudCfg(url, key);
+  cloudSync(false);
+}
+window.addEventListener("online", function(){ setSyncStatus("🔄 इन्टरनेट आयो, Sync हुँदैछ..."); cloudSync(true); });
+window.addEventListener("offline", function(){ setSyncStatus("📴 Offline — इन्टरनेट आएपछि मिल्छ"); });
+
 /* ===== Init ===== */
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => show(b.dataset.p));
 load();
 renderAll();
+(function(){ const c=getCloudCfg(); const u=document.getElementById("cUrl"), k=document.getElementById("cKey"); if(u&&c.url) u.value=c.url; if(k&&c.key) k.value=c.key; if(!navigator.onLine) setSyncStatus("📴 Offline — इन्टरनेट आएपछि मिल्छ"); else if(c.url&&c.key) cloudSync(true); })();
 ["lockUser","lockPass","lockPass2"].forEach(id => $(id).addEventListener("keydown", e => { if (e.key === "Enter") lockSubmit(); }));
 showLock();
 (function(){var l=document.querySelector('link[rel="icon"]');if(!l){l=document.createElement("link");l.rel="icon";document.head.appendChild(l);}l.type="image/png";l.href=ICON_URI;})();
